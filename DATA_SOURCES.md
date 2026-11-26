@@ -609,6 +609,21 @@ id. A non-empty local pack replaces the live open-data camera packs unless
 `CCTV_FORCE_AUSTIN=1` is set. The packs under `config/` show the schema, and a
 pack's cameras keep their own source's license and attribution.
 
+Set `CCTV_DAVAO_SOURCES_FILE` to an operator-reviewed JSON file to add Davao
+City cameras to the existing catalog. This setting is independent of the
+legacy local override and its live-pack switches. Davao uses spare catalog
+slots. If the catalog is full, increase `CCTV_MAX_SOURCES` within its existing
+limits to make room. An existing camera keeps its ID if a Davao row duplicates it.
+
+Each row requires a stable `ph-davao-` ID, `name`, `lat`, `lon`, `provider`,
+`license` documenting permission for your intended use, a public attribution
+page in `sourceUrl`, and the authorized direct feed in `url`. Use HTTPS URLs
+without embedded credentials and set `feedType` to the corresponding existing
+CCTV media type. An optional `snapshotUrl` follows the same HTTPS requirement.
+Verify each location and playback with the operator before enabling the pack.
+No feeds are bundled. [JazBaz Philippines](https://jazbazphilippines.com/map)
+offers public viewing on its own site and YouTube.
+
 ---
 
 ## Weather sources

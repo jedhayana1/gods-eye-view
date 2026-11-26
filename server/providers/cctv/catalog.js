@@ -7,7 +7,12 @@ import {
 } from './constants.js';
 import { allocateSourceCap, resolveCatalogCap } from './cap.js';
 import { loadGroundHeights, joinGroundHeights } from './groundHeights.js';
-import { cameraRegion, normalizeSourceItem } from './normalize.js';
+import {
+  cameraRegion,
+  normalizeFeedType,
+  normalizeSourceItem,
+  toFiniteNumber,
+} from './normalize.js';
 import { loadLithuaniaSources } from './lithuania.js';
 import { loadOttawaSourcesFromOpenData } from './ottawa.js';
 import { loadQuebecSources, QUEBEC_CAMERA_SOURCE_COUNT } from './quebec.js';
@@ -209,12 +214,14 @@ const LIVE_PACKS = [
   },
 ];
 /**
- * Load CCTV sources from a local JSON file (CCTV_SOURCES_FILE env or default).
+ * Load CCTV sources from a local JSON file. Defaults to the legacy pack.
  *
  * @returns {Array<object>} Array of raw source objects, or [] on error.
  */
-function loadSourcesFromFile(sourceRoot) {
-  const sourceFile = process.env.CCTV_SOURCES_FILE || DEFAULT_CCTV_SOURCE_FILE;
+function loadSourcesFromFile(
+  sourceRoot,
+  sourceFile = process.env.CCTV_SOURCES_FILE || DEFAULT_CCTV_SOURCE_FILE,
+) {
   const resolved = path.isAbsolute(sourceFile)
     ? sourceFile
     : path.resolve(sourceRoot, sourceFile);
@@ -231,6 +238,53 @@ function loadSourcesFromFile(sourceRoot) {
     );
     return [];
   }
+}
+
+function isHttpsCameraUrl(value) {
+  const url = typeof value === 'string' ? URL.parse(value) : null;
+  return url?.protocol === 'https:' && !url.username && !url.password;
+}
+
+/** An optional, operator-reviewed city pack outside the legacy override gate. */
+function loadDavaoSources(sourceRoot) {
+  const sourceFile = process.env.CCTV_DAVAO_SOURCES_FILE?.trim();
+  if (!sourceFile) return [];
+  return loadSourcesFromFile(sourceRoot, sourceFile)
+    .filter((item) => {
+      const lat = toFiniteNumber(item?.lat);
+      const lon = toFiniteNumber(item?.lon);
+      const feedType = normalizeFeedType(item?.feedType || item?.type);
+      return (
+        typeof item?.id === 'string' &&
+        /^ph-davao-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(item.id) &&
+        // Broad coordinate sanity check. Operators verify the actual city location.
+        lat >= 6.85 &&
+        lat <= 7.8 &&
+        lon >= 125.05 &&
+        lon <= 125.75 &&
+        typeof item.name === 'string' &&
+        item.name.trim() &&
+        typeof item.provider === 'string' &&
+        item.provider.trim() &&
+        typeof item.license === 'string' &&
+        item.license.trim() &&
+        ['image', 'mjpeg', 'mp4', 'webm', 'hls'].includes(feedType) &&
+        isHttpsCameraUrl(item.sourceUrl) &&
+        isHttpsCameraUrl(item.url) &&
+        (item.snapshotUrl == null ||
+          item.snapshotUrl === '' ||
+          isHttpsCameraUrl(item.snapshotUrl))
+      );
+    })
+    .map((item) => ({
+      ...item,
+      city: 'Davao City',
+      cityId: 'davao',
+      sourceKind: 'configured',
+      url: item.url.trim(),
+      sourceUrl: item.sourceUrl.trim(),
+      snapshotUrl: item.snapshotUrl?.trim() || '',
+    }));
 }
 
 /**
@@ -377,6 +431,23 @@ export function createCctvCatalog({ sourceRoot = process.cwd() } = {}) {
     ];
     const maxCount = resolveCatalogCap(process.env.CCTV_MAX_SOURCES);
     const allocation = allocateSourceCap(packs, maxCount);
+    const baselineCount = allocation.sources.length;
+    const davaoSources = loadDavaoSources(sourceRoot);
+    if (davaoSources.length) {
+      // Keep the baseline winners and their order, even at a tight cap. The
+      // city pack can only fill spare slots and cannot override an existing ID.
+      const existingIds = new Set(
+        packs.flatMap((pack) => pack.sources.map((source) => source.id)),
+      );
+      const davaoPack = normalizePack(
+        'davao',
+        davaoSources.filter((source) => !existingIds.has(source.id)),
+      );
+      const addition = allocateSourceCap([davaoPack], maxCount - baselineCount);
+      packs.push(davaoPack);
+      allocation.sources.push(...addition.sources);
+      allocation.packs.push(...addition.packs);
+    }
     // Shipped ground heights (src/data/local_data/cctv_ground_heights/, produced by
     // scripts/precompute-cctv-heights.mjs) ride along on the served source so
     // the client can place a camera and its monitor plane with zero sampling.
@@ -400,10 +471,14 @@ export function createCctvCatalog({ sourceRoot = process.cwd() } = {}) {
         .map((pack) => `${pack.name} ${pack.kept}/${pack.offered}`)
         .join(', ');
       console.warn(
-        `[CCTV] source catalog exceeds cap ${maxCount}; shared round-robin across packs (${detail}). Raise CCTV_MAX_SOURCES or lower a per-pack cap to change the mix.`,
+        `[CCTV] source catalog exceeds cap ${maxCount} (${detail}). Raise CCTV_MAX_SOURCES or lower a per-pack cap to change the mix.`,
       );
     }
-    if (capped.length > 0 || _cctvSourceCache.length === 0) {
+    // Davao alone must not mask an empty refresh of an existing global catalog.
+    const lostBaseline =
+      baselineCount === 0 &&
+      _cctvSourceCache.some((source) => source.pack !== 'davao');
+    if (!lostBaseline && (capped.length > 0 || _cctvSourceCache.length === 0)) {
       _cctvSourceCache = capped;
       _cctvTrimmedPacks.set(capped, trimmedPacks);
       _cctvSourceBuiltAt = Date.now();

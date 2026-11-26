@@ -18,6 +18,7 @@ import {
   quebecBrowserVideoEnabled,
 } from '../../server/providers/cctv/quebec.js';
 import { cctvProxy } from '../../server/providers/cctv.js';
+import { createCctvCatalog } from '../../server/providers/cctv/catalog.js';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '../..');
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9]);
@@ -69,6 +70,17 @@ const oregonRow = (overrides = {}) => ({
   snapshotUrl: 'https://www.tripcheck.com/roadcams/cams/Harwood_pid3527.jpg',
   ...overrides,
 });
+
+const davaoRow = {
+  id: 'ph-davao-test',
+  name: 'Test camera',
+  lat: 7.07,
+  lon: 125.61,
+  provider: 'Test provider',
+  license: 'Mock data',
+  sourceUrl: 'https://cameras.example.test/about',
+  url: 'https://cameras.example.test/frame.jpg',
+};
 
 test('the shipped World catalog loads every curated row', (t) => {
   quiet(t);
@@ -230,6 +242,93 @@ function mount(t, root, respond) {
   };
   return { call, requests };
 }
+
+test('an authorized Davao pack is served alongside the World pack', async (t) => {
+  quiet(t);
+  const world = oregonRow();
+  const root = sourceRoot(t, { world: [world] });
+  fs.writeFileSync(
+    path.join(root, 'davao.json'),
+    JSON.stringify([
+      davaoRow,
+      { ...davaoRow, id: 'ph-davao-unlicensed', license: '' },
+      { ...davaoRow, id: 'ph-davao-outside', lat: 1 },
+      {
+        ...davaoRow,
+        id: 'ph-davao-credentialed',
+        url: 'https://a:b@example.test/cam',
+      },
+    ]),
+  );
+  withEnv(t, {
+    CCTV_DAVAO_SOURCES_FILE: 'davao.json',
+    CCTV_PREFER_AUSTIN: '1',
+    CCTV_WORLD_CAMERAS_ENABLED: '1',
+  });
+  const app = mount(t, root, (url) =>
+    url === davaoRow.url
+      ? new Response(JPEG, { headers: { 'content-type': 'image/jpeg' } })
+      : null,
+  );
+  const { sources } = JSON.parse((await app.call('/sources')).body);
+  assert.deepEqual(
+    sources.map(({ id, pack }) => ({ id, pack })),
+    [
+      { id: world.id, pack: 'world-cameras' },
+      { id: davaoRow.id, pack: 'davao' },
+    ],
+  );
+  assert.equal(sources[1].city, 'Davao City');
+  assert.equal(sources[1].license, davaoRow.license);
+  const frame = await app.call(`/frame/${davaoRow.id}`);
+  assert.equal(frame.headers['X-CCTV-Source'], 'upstream-image');
+  assert.deepEqual(frame.body, JPEG);
+});
+
+test('Davao only uses spare slots and keeps every existing camera at the cap', async (t) => {
+  quiet(t);
+  t.mock.method(
+    globalThis,
+    'fetch',
+    async () => new Response('down', { status: 503 }),
+  );
+  const world = Array.from({ length: 8 }, (_, i) =>
+    oregonRow({ id: `world-or-${i}` }),
+  );
+  const root = sourceRoot(t, { world });
+  fs.writeFileSync(path.join(root, 'davao.json'), JSON.stringify([davaoRow]));
+  withEnv(t, {
+    CCTV_DAVAO_SOURCES_FILE: 'davao.json',
+    CCTV_MAX_SOURCES: '8',
+    CCTV_SOURCES_FILE: 'absent-source-file.json',
+    CCTV_SOURCES_JSON: undefined,
+    CCTV_PREFER_AUSTIN: '1',
+    CCTV_WORLD_CAMERAS_ENABLED: '1',
+  });
+  const getSources = createCctvCatalog({ sourceRoot: root });
+  const capped = await getSources();
+  assert.deepEqual(
+    capped.map(({ id }) => id),
+    world.map(({ id }) => id),
+  );
+  const [trimmed] = getSources.trimmedPacks(capped);
+  assert.deepEqual(
+    { ...trimmed, region: undefined },
+    {
+      pack: 'davao',
+      available: 1,
+      served: 0,
+      region: undefined,
+    },
+  );
+
+  process.env.CCTV_MAX_SOURCES = '9';
+  const expanded = await createCctvCatalog({ sourceRoot: root })();
+  assert.deepEqual(
+    expanded.map(({ id }) => id),
+    [...world.map(({ id }) => id), davaoRow.id],
+  );
+});
 
 test('/sources lists Québec browser media only when the operator opts in', async (t) => {
   quiet(t);
